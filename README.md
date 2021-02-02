@@ -1,3 +1,7 @@
+# Note
+
+Move to [@plotdb/sharedb-postgres](https://github.com/plotdb/sharedb-postgres). Don't use this repo unless for compatibility reason.
+
 # sharedb-postgres
 
 PostgreSQL database adapter for [sharedb](https://github.com/share/sharedb). This
