@@ -1,11 +1,17 @@
 const DB = require('sharedb').DB;
 const pg = require('pg');
+
+// Cache of snapshots to return, to avoid fetch I/O
 const snapshotCache = new Map();
-const writeTimeouts = new Map();
-const snapshotWrites = new Map();
+
+// setTimeouts for flushing
+const flushTimeouts = new Map();
+
+const pendingSnapshotFlushValues = new Map();
 const flushingSymbol = "flushing";
 
 const WRITE_FLUSH_DELAY = 500;
+const MAX_CACHED_SNAPSHOTS = 128;
 
 /*
 * This query uses common table expression to upsert the snapshot table 
@@ -116,19 +122,21 @@ PostgresDB.prototype.close = function(callback) {
 // callback(err, succeeded)
 PostgresDB.prototype.commit = function(collection, id, op, snapshot, options, callback) {
   const cacheKey = `${collection}_${id}`;
-  let writes = snapshotWrites.get(cacheKey);
-  if (!writes) {
-    writes = [];
-    snapshotWrites.set(cacheKey, writes);
+  let pendingValues = pendingSnapshotFlushValues.get(cacheKey);
+
+  if (!pendingValues) {
+    pendingValues = [];
+    pendingSnapshotFlushValues.set(cacheKey, pendingValues);
   }
 
-  for (let i = 0; i < writes.length; i++) {
-    writes[i][4] = null;
+  for (let i = 0; i < pendingValues.length; i++) {
+    // Skip writing the data for all the previous pending values.
+    pendingValues[i][4] = null;
   }
 
-  writes.push([collection,id,snapshot.v, snapshot.type, snapshot.data, op])
+  pendingValues.push([collection,id,snapshot.v, snapshot.type, snapshot.data, op])
 
-  const timeout = writeTimeouts.get(cacheKey);
+  const timeout = flushTimeouts.get(cacheKey);
 
   // If a flush is enqueued, delay it.
   if (timeout && timeout !== flushingSymbol) {
@@ -137,11 +145,11 @@ PostgresDB.prototype.commit = function(collection, id, op, snapshot, options, ca
 
   // If a flush is not currently running, enqueue it.
   if (timeout !== flushingSymbol) {
-    writeTimeouts.set(cacheKey, setTimeout(async () => {
+    flushTimeouts.set(cacheKey, setTimeout(async () => {
       // When timeout is hit, mark this key as flushing
-      writeTimeouts.set(cacheKey, flushingSymbol);
+      flushTimeouts.set(cacheKey, flushingSymbol);
 
-      const writes = snapshotWrites.get(cacheKey);
+      const pendingValues = pendingSnapshotFlushValues.get(cacheKey);
 
       /*
        * op: CreateOp {
@@ -164,8 +172,8 @@ PostgresDB.prototype.commit = function(collection, id, op, snapshot, options, ca
           let failed = false;
 
           // Flush all pending writes.
-          while (writes.length > 0 && !failed) {
-            const values = writes[0];
+          while (pendingValues.length > 0 && !failed) {
+            const values = pendingValues[0];
 
             let query;
 
@@ -178,6 +186,11 @@ PostgresDB.prototype.commit = function(collection, id, op, snapshot, options, ca
                 values
               };
             } else {
+              // Skip the data for an intermediate version update, to reduce
+              // I/O and ensure consistency.
+              //
+              // This is safe to do since the version is served up by the 
+              // snapshot cache.
               query = {
                 name: 'sdb-commit-op-and-snap-skip-data',
                 text: SNAPSHOT_SKIP_DATA_SQL,
@@ -192,7 +205,7 @@ PostgresDB.prototype.commit = function(collection, id, op, snapshot, options, ca
                     failed = true;
                   } else {
                     // Dequeue write
-                    writes.shift();
+                    pendingValues.shift();
                   }
                   r();
                 });
@@ -202,13 +215,17 @@ PostgresDB.prototype.commit = function(collection, id, op, snapshot, options, ca
 
           if (!failed) {
             done(client);
-            flushRes();
           }
+
+          flushRes();
         })
       });
 
-      writeTimeouts.delete(cacheKey);
-      snapshotWrites.delete(cacheKey);
+      flushTimeouts.delete(cacheKey);
+
+      if (pendingValues.length === 0) {
+        pendingSnapshotFlushValues.delete(cacheKey);
+      }
     }, WRITE_FLUSH_DELAY));
   }
 
@@ -219,6 +236,15 @@ PostgresDB.prototype.commit = function(collection, id, op, snapshot, options, ca
 // snapshot). A snapshot with a version of zero is returned if the docuemnt
 // has never been created in the database.
 PostgresDB.prototype.getSnapshot = function(collection, id, fields, options, callback) {
+
+  // Use this opportunity to clean the snapshot cache.
+  //
+  // Don't clear it if there are pending flushes since that can cause consistency
+  // problems.
+  if (snapshotCache.size >= MAX_CACHED_SNAPSHOTS && !this.hasPendingFlush()) {
+    snapshotCache.clear();
+  }
+
   const cacheKey = `${collection}_${id}`;
   const snapshot = snapshotCache.get(cacheKey);
 
@@ -306,7 +332,7 @@ PostgresDB.prototype.getOps = function(collection, id, from, to, options, callba
 };
 
 PostgresDB.prototype.hasPendingFlush = function() {
-  return snapshotWrites.size > 0;
+  return pendingSnapshotFlushValues.size > 0;
 };
 
 function PostgresSnapshot(id, version, type, data, meta) {
