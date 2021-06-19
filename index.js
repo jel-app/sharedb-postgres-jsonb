@@ -6,11 +6,13 @@ const snapshotCache = new Map();
 
 // setTimeouts for flushing
 const flushTimeouts = new Map();
+const flushRetryTimeouts = new Map();
 
 const pendingSnapshotFlushValues = new Map();
 const flushingSymbol = "flushing";
 
 const WRITE_FLUSH_DELAY = 500;
+const RETRY_FLUSH_DELAY = 5000;
 const MAX_CACHED_SNAPSHOTS = 128;
 
 /*
@@ -102,6 +104,7 @@ function PostgresDB(options) {
   DB.call(this, options);
 
   this.closed = false;
+  this.disableFlushRetries = false;
 
   this.pg_config = options;
   this.pool = new pg.Pool(options);
@@ -145,9 +148,11 @@ PostgresDB.prototype.commit = function(collection, id, op, snapshot, options, ca
 
   // If a flush is not currently running, enqueue it.
   if (timeout !== flushingSymbol) {
-    flushTimeouts.set(cacheKey, setTimeout(async () => {
+    const flush = async () => {
       // When timeout is hit, mark this key as flushing
       flushTimeouts.set(cacheKey, flushingSymbol);
+
+      if (!pendingSnapshotFlushValues.has(cacheKey)) return;
 
       const pendingValues = pendingSnapshotFlushValues.get(cacheKey);
 
@@ -215,6 +220,19 @@ PostgresDB.prototype.commit = function(collection, id, op, snapshot, options, ca
 
           if (!failed) {
             done(client);
+          } else if (!this.disableFlushRetries) {
+            const retryTimeout = flushRetryTimeouts.get(cacheKey);
+
+            if (retryTimeout) {
+              clearTimeout(retryTimeout);
+            }
+
+            // Retry in case of error
+            flushRetryTimeouts.set(cacheKey, setTimeout(() => {
+              if (!flushTimeouts.has(cacheKey)) {
+                flush();
+              }
+            }, RETRY_FLUSH_DELAY));
           }
 
           flushRes();
@@ -226,7 +244,9 @@ PostgresDB.prototype.commit = function(collection, id, op, snapshot, options, ca
       if (pendingValues.length === 0) {
         pendingSnapshotFlushValues.delete(cacheKey);
       }
-    }, WRITE_FLUSH_DELAY));
+    };
+
+    flushTimeouts.set(cacheKey, setTimeout(flush, WRITE_FLUSH_DELAY));
   }
 
   callback(null, snapshotCache.has(cacheKey));
@@ -263,7 +283,7 @@ PostgresDB.prototype.getSnapshot = function(collection, id, fields, options, cal
       'SELECT version, data, doc_type FROM snapshots WHERE collection = $1 AND doc_id = $2 LIMIT 1',
       [collection, id],
       function(err, res) {
-        done();
+        done(client);
         if (err) {
           callback(err);
           return;
@@ -318,7 +338,7 @@ PostgresDB.prototype.getOps = function(collection, id, from, to, options, callba
     cmd += ' order by version';
     client.query( cmd, params,
       function(err, res) {
-        done();
+        done(client);
         if (err) {
           callback(err);
           return;
@@ -333,6 +353,20 @@ PostgresDB.prototype.getOps = function(collection, id, from, to, options, callba
 
 PostgresDB.prototype.hasPendingFlush = function() {
   return pendingSnapshotFlushValues.size > 0;
+};
+
+PostgresDB.prototype.purgeOldOps = function() {
+  this.pool.connect(function(err, client, done) {
+    if (err) {
+      done(client);
+      return;
+    }
+
+    const cmd = "DELETE from ops where inserted_at < now() - interval '1 day'";
+    const params = [];
+
+    client.query( cmd, [], () => done(client));
+  })
 };
 
 function PostgresSnapshot(id, version, type, data, meta) {
