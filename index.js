@@ -249,6 +249,13 @@ PostgresDB.prototype.commit = function(collection, id, op, snapshot, options, ca
     flushTimeouts.set(cacheKey, setTimeout(flush, WRITE_FLUSH_DELAY));
   }
 
+  // NOTE: we optimistically confirm the commit here. This will cause clients to
+  // start breaking if the commits are not actually landed during an outage
+  // that doesn't gracefully shutdown the server since the client's version
+  // will be ahead of what is in the database.
+  //
+  // This will need to be fixed eventually when adding better fault tolerance
+  // but is necessary to ensure low latency and not slapping the db with I/O.
   callback(null, snapshotCache.has(cacheKey));
 };
 
@@ -268,6 +275,8 @@ PostgresDB.prototype.getSnapshot = function(collection, id, fields, options, cal
   const cacheKey = `${collection}_${id}`;
   const snapshot = snapshotCache.get(cacheKey);
 
+  // NOTE: we return the snapshot as-is here to avoid additional I/O.
+  // This is less correct, and presumes that the server is a singleton.
   if (snapshot) {
     callback(null, snapshot);
     return;
