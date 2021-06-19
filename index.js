@@ -223,12 +223,10 @@ PostgresDB.prototype.getSnapshot = function(collection, id, fields, options, cal
   const snapshot = snapshotCache.get(cacheKey);
 
   if (snapshot) {
-    console.log("got", collection, id);
     callback(null, snapshot);
     return;
   }
 
-  console.log("fetch", collection, id);
   this.pool.connect(function(err, client, done) {
     if (err) {
       done(client);
@@ -253,7 +251,6 @@ PostgresDB.prototype.getSnapshot = function(collection, id, fields, options, cal
             row.data,
             undefined // TODO: metadata
           )
-          console.log("latest", collection, id, row.version)
           snapshotCache.set(cacheKey, snapshot);
           callback(null, snapshot);
         } else {
@@ -306,6 +303,10 @@ PostgresDB.prototype.getOps = function(collection, id, from, to, options, callba
       }
     )
   })
+};
+
+PostgresDB.prototype.hasPendingFlush = function() {
+  return snapshotWrites.size > 0;
 };
 
 function PostgresSnapshot(id, version, type, data, meta) {
