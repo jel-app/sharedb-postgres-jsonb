@@ -362,7 +362,7 @@ PostgresDB.prototype.purgeOldOps = function() {
       return;
     }
 
-    const cmd = "DELETE from ops where inserted_at < now() - interval '1 day'";
+    const cmd = "DELETE from ops where inserted_at < now() - interval '1 hour'";
     const params = [];
 
     client.query( cmd, [], () => done(client));
