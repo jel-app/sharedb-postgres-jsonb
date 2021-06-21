@@ -374,10 +374,10 @@ PostgresDB.prototype.purgeOldOps = function() {
     // Keep the last 10 ops for a given doc
     const cmd = `
       DELETE
-      FROM sharedb.ops op1
+      FROM ops op1
       WHERE op1.inserted_at < now() - interval '12 hours'
       AND op1.inserted_at NOT IN (SELECT inserted_at
-                       FROM sharedb.ops op2
+                       FROM ops op2
                        WHERE op1.collection = op2.collection AND op1.doc_id = op2.doc_id
                        ORDER BY op2.inserted_at DESC
                        LIMIT 10)`;
